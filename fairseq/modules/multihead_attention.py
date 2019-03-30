@@ -82,7 +82,9 @@ class MultiheadAttention(nn.Module):
 
         if incremental_state is not None:
             saved_state = self._get_input_buffer(incremental_state)
-            if 'prev_key' in saved_state:
+            #print("cp1: len saved_state:", len(saved_state))
+            #if 'prev_key' in saved_state:
+            if len(saved_state) > 0:
                 # previous time steps are cached - no need to recompute
                 # key and value if they are static
                 if static_kv:
@@ -126,22 +128,29 @@ class MultiheadAttention(nn.Module):
 
         if saved_state is not None:
             # saved states are stored with shape (bsz, num_heads, seq_len, head_dim)
-            if 'prev_key' in saved_state:
-                prev_key = saved_state['prev_key'].view(bsz * self.num_heads, -1, self.head_dim)
+            #if 'prev_key' in saved_state:
+            if len(saved_state) > 0:
+                #prev_key = saved_state['prev_key'].view(bsz * self.num_heads, -1, self.head_dim)
+                print("saved_state", type(saved_state), len(saved_state))
+                prev_key = saved_state[0].view(bsz * self.num_heads, -1, self.head_dim)
                 if static_kv:
                     k = prev_key
                 else:
                     k = torch.cat((prev_key, k), dim=1)
-            if 'prev_value' in saved_state:
-                prev_value = saved_state['prev_value'].view(bsz * self.num_heads, -1, self.head_dim)
+            #if 'prev_value' in saved_state:
+            if len(saved_state) > 0:
+                #prev_value = saved_state['prev_value'].view(bsz * self.num_heads, -1, self.head_dim)
+                prev_value = saved_state[1].view(bsz * self.num_heads, -1, self.head_dim)
                 if static_kv:
                     v = prev_value
                 else:
                     v = torch.cat((prev_value, v), dim=1)
-            saved_state['prev_key'] = k.view(bsz, self.num_heads, -1, self.head_dim)
-            saved_state['prev_value'] = v.view(bsz, self.num_heads, -1, self.head_dim)
+            #saved_state['prev_key'] = k.view(bsz, self.num_heads, -1, self.head_dim)
+            #saved_state['prev_value'] = v.view(bsz, self.num_heads, -1, self.head_dim)
+            new_state = (k.view(bsz, self.num_heads, -1, self.head_dim),
+                         v.view(bsz, self.num_heads, -1, self.head_dim))
 
-            self._set_input_buffer(incremental_state, saved_state)
+            self._set_input_buffer(incremental_state, new_state)
 
         src_len = k.size(1)
 
@@ -233,8 +242,10 @@ class MultiheadAttention(nn.Module):
         """Reorder buffered internal state (for incremental generation)."""
         input_buffer = self._get_input_buffer(incremental_state)
         if input_buffer is not None:
-            for k in input_buffer.keys():
-                input_buffer[k] = input_buffer[k].index_select(0, new_order)
+            #for k in input_buffer.keys():
+            #    input_buffer[k] = input_buffer[k].index_select(0, new_order)
+            new_buffer = (input_buffer[0].index_select(0, new_order),
+                    input_buffer[1].index_select(0, new_order))
             self._set_input_buffer(incremental_state, input_buffer)
 
     def _get_input_buffer(self, incremental_state):
@@ -242,7 +253,8 @@ class MultiheadAttention(nn.Module):
             self,
             incremental_state,
             'attn_state',
-        ) or {}
+        #) or {}
+        ) or ()
 
     def _set_input_buffer(self, incremental_state, buffer):
         utils.set_incremental_state(

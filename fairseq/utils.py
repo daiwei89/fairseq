@@ -202,6 +202,16 @@ def move_to_cuda(sample):
 
 INCREMENTAL_STATE_INSTANCE_ID = defaultdict(lambda: 0)
 
+class SetSequencer:
+    def __init__(self):
+        self.map = {}
+
+    def get_id(self, key):
+        if key not in self.map:
+            self.map[key] = len(self.map)
+        return self.map[key]
+
+STATE_KEY_TO_ID = SetSequencer()
 
 def _get_full_incremental_state_key(module_instance, key):
     module_name = module_instance.__class__.__name__
@@ -214,20 +224,38 @@ def _get_full_incremental_state_key(module_instance, key):
 
     return '{}.{}.{}'.format(module_name, module_instance._fairseq_instance_id, key)
 
+ACCESS_ID = 0
 
 def get_incremental_state(module, incremental_state, key):
     """Helper for getting incremental state for an nn.Module."""
     full_key = _get_full_incremental_state_key(module, key)
-    if incremental_state is None or full_key not in incremental_state:
+    #if incremental_state is None or full_key not in incremental_state:
+    #    return None
+    #return incremental_state[full_key]
+    global ACCESS_ID
+    #print("Access", ACCESS_ID, "key:", full_key)
+    ACCESS_ID += 1
+    if incremental_state is None or full_key not in STATE_KEY_TO_ID.map:
         return None
-    return incremental_state[full_key]
+    list_idx = STATE_KEY_TO_ID.get_id(full_key)
+    assert len(incremental_state) > list_idx
+    return incremental_state[list_idx]
 
 
 def set_incremental_state(module, incremental_state, key, value):
     """Helper for setting incremental state for an nn.Module."""
+    global STATE_KEY_TO_ID
+    #print("XXXX set_incremental_state:", type(key), type(value))
     if incremental_state is not None:
         full_key = _get_full_incremental_state_key(module, key)
-        incremental_state[full_key] = value
+        #incremental_state[full_key] = value
+        list_idx = STATE_KEY_TO_ID.get_id(full_key)
+        assert len(incremental_state) >= list_idx
+        assert type(value) is tuple
+        if len(incremental_state) < list_idx + 1:
+            incremental_state.append(value)
+        else:
+            incremental_state[list_idx] = value
 
 
 def load_align_dict(replace_unk):

@@ -295,6 +295,9 @@ class TransformerEncoder(FairseqEncoder):
         if self.normalize:
             self.layer_norm = LayerNorm(embed_dim)
 
+    def prepare_for_onnx_export_(self):
+        self.embed_positions.prepare_for_onnx_export_()
+
     def forward(self, src_tokens, src_lengths):
         """
         Args:
@@ -314,6 +317,7 @@ class TransformerEncoder(FairseqEncoder):
         x = self.embed_scale * self.embed_tokens(src_tokens)
         if self.embed_positions is not None:
             x += self.embed_positions(src_tokens)
+        """
         x = F.dropout(x, p=self.dropout, training=self.training)
 
         # B x T x C -> T x B x C
@@ -330,11 +334,15 @@ class TransformerEncoder(FairseqEncoder):
 
         if self.normalize:
             x = self.layer_norm(x)
+        """
 
-        return {
-            'encoder_out': x,  # T x B x C
-            'encoder_padding_mask': encoder_padding_mask,  # B x T
-        }
+        #return {
+        #    'encoder_out': x,  # T x B x C
+        #    'encoder_padding_mask': encoder_padding_mask,  # B x T
+        #}
+        # Comment(daviddai): `encoder_padding_mask` is not None only if
+        # `src_tokens` includes padding (self.padding_idx)
+        return x
 
     def reorder_encoder_out(self, encoder_out, new_order):
         """
@@ -446,6 +454,11 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         if self.normalize:
             self.layer_norm = LayerNorm(embed_dim)
 
+    def prepare_for_onnx_export_(self):
+        self.embed_positions.prepare_for_onnx_export_()
+        for layer in self.layers:
+            layer.prepare_for_onnx_export_()
+
     def forward(self, prev_output_tokens, encoder_out=None, incremental_state=None):
         """
         Args:
@@ -469,6 +482,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             incremental_state=incremental_state,
         ) if self.embed_positions is not None else None
 
+        """
         if incremental_state is not None:
             prev_output_tokens = prev_output_tokens[:, -1:]
             if positions is not None:
@@ -494,8 +508,10 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         for layer in self.layers:
             x, attn = layer(
                 x,
-                encoder_out['encoder_out'] if encoder_out is not None else None,
-                encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
+                #encoder_out['encoder_out'] if encoder_out is not None else None,
+                encoder_out if encoder_out is not None else None,
+                #encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
+                None,
                 incremental_state,
                 self_attn_mask=self.buffered_future_mask(x) if incremental_state is None else None,
             )
@@ -517,7 +533,10 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             else:
                 x = F.linear(x, self.embed_out)
 
-        return x, {'attn': attn, 'inner_states': inner_states}
+        #return x, {'attn': attn, 'inner_states': inner_states}
+        return (x, attn, inner_states)
+        """
+        return positions
 
     def max_positions(self):
         """Maximum output length supported by the decoder."""
@@ -694,7 +713,7 @@ class TransformerDecoderLayer(nn.Module):
         x = self.maybe_layer_norm(self.self_attn_layer_norm, x, before=True)
         if prev_self_attn_state is not None:
             if incremental_state is None:
-                incremental_state = {}
+                incremental_state = []
             prev_key, prev_value = prev_self_attn_state
             saved_state = {"prev_key": prev_key, "prev_value": prev_value}
             self.self_attn._set_input_buffer(incremental_state, saved_state)
@@ -717,7 +736,7 @@ class TransformerDecoderLayer(nn.Module):
             x = self.maybe_layer_norm(self.encoder_attn_layer_norm, x, before=True)
             if prev_attn_state is not None:
                 if incremental_state is None:
-                    incremental_state = {}
+                    incremental_state = []
                 prev_key, prev_value = prev_attn_state
                 saved_state = {"prev_key": prev_key, "prev_value": prev_value}
                 self.encoder_attn._set_input_buffer(incremental_state, saved_state)
@@ -744,8 +763,9 @@ class TransformerDecoderLayer(nn.Module):
         x = self.maybe_layer_norm(self.final_layer_norm, x, after=True)
         if self.onnx_trace:
             saved_state = self.self_attn._get_input_buffer(incremental_state)
-            self_attn_state = saved_state["prev_key"], saved_state["prev_value"]
-            return x, attn, self_attn_state
+            #self_attn_state = saved_state["prev_key"], saved_state["prev_value"]
+            #return x, attn, self_attn_state
+            return x, attn
         return x, attn
 
     def maybe_layer_norm(self, layer_norm, x, before=False, after=False):

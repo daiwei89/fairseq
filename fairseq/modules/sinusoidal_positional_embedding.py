@@ -44,6 +44,7 @@ class SinusoidalPositionalEmbedding(nn.Module):
         This matches the implementation in tensor2tensor, but differs slightly
         from the description in Section 3.5 of "Attention Is All You Need".
         """
+        print("===== get_embedding ===")
         half_dim = embedding_dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, dtype=torch.float) * -emb)
@@ -60,7 +61,9 @@ class SinusoidalPositionalEmbedding(nn.Module):
         """Input is expected to be of size [bsz x seqlen]."""
         bsz, seq_len = torch.onnx.operators.shape_as_tensor(input)
         max_pos = self.padding_idx + 1 + seq_len
+        print("==== embedding forward, padding_idx:", self.padding_idx, "seq len:", seq_len, "max_pos:", max_pos)
         if self.weights is None or max_pos > self.weights.size(0):
+            print("===== Recompute expand embedding")
             # recompute/expand embeddings if needed
             self.weights = SinusoidalPositionalEmbedding.get_embedding(
                 max_pos,
@@ -73,7 +76,7 @@ class SinusoidalPositionalEmbedding(nn.Module):
             # positions is the same for every token when decoding a single step
             pos = (timestep.int() + 1).long() if timestep is not None else seq_len
             if self.onnx_trace:
-                return self.weights[self.padding_idx + pos, :].unsqueeze(1).repeat(bsz, 1, 1)
+                return self.weights[self.padding_idx + pos, :].unsqueeze(1).unsqueeze(0).repeat(bsz, 1, 1)
             return self.weights[self.padding_idx + pos, :].expand(bsz, 1, -1)
 
         positions = utils.make_positions(input, self.padding_idx, self.left_pad, self.onnx_trace)

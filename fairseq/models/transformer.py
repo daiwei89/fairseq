@@ -294,6 +294,11 @@ class TransformerEncoder(FairseqEncoder):
         self.normalize = args.encoder_normalize_before
         if self.normalize:
             self.layer_norm = LayerNorm(embed_dim)
+        self.max_src_len = args.max_source_positions
+        self.decoder = None
+
+    def set_decoder(self, decoder):
+        self.decoder = decoder
 
     def prepare_for_onnx_export_(self):
         self.embed_positions.prepare_for_onnx_export_()
@@ -302,7 +307,7 @@ class TransformerEncoder(FairseqEncoder):
         """
         Args:
             src_tokens (LongTensor): tokens in the source language of shape
-                `(batch, src_len)`
+                `(batch, max_src_len)`
             src_lengths (torch.LongTensor): lengths of each source sentence of
                 shape `(batch)`
 
@@ -314,10 +319,11 @@ class TransformerEncoder(FairseqEncoder):
                   padding elements of shape `(batch, src_len)`
         """
         # embed tokens and positions
+        src_len = src_lengths[0]
+        src_tokens = src_tokens[:,:src_len]
         x = self.embed_scale * self.embed_tokens(src_tokens)
         if self.embed_positions is not None:
             x += self.embed_positions(src_tokens)
-        """
         x = F.dropout(x, p=self.dropout, training=self.training)
 
         # B x T x C -> T x B x C
@@ -334,7 +340,15 @@ class TransformerEncoder(FairseqEncoder):
 
         if self.normalize:
             x = self.layer_norm(x)
-        """
+
+        num_pads = self.max_src_len - src_len
+        x = nn.functional.pad(x, (0, 0, 0, 0, 0, num_pads))
+
+        # Generate kv_cache for decoder's encoder_attention layer.
+        if self.decoder is not None:
+            kv_cache = self.decoder.get_encoder_kv_cache(x, src_len)
+            return x, kv_cache
+        return x
 
         #return {
         #    'encoder_out': x,  # T x B x C
@@ -342,7 +356,7 @@ class TransformerEncoder(FairseqEncoder):
         #}
         # Comment(daviddai): `encoder_padding_mask` is not None only if
         # `src_tokens` includes padding (self.padding_idx)
-        return x
+        #return x
 
     def reorder_encoder_out(self, encoder_out, new_order):
         """
@@ -453,21 +467,49 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self.normalize = args.decoder_normalize_before and final_norm
         if self.normalize:
             self.layer_norm = LayerNorm(embed_dim)
+        self.args = args
+        self.max_tgt_len = args.max_target_positions
 
     def prepare_for_onnx_export_(self):
         self.embed_positions.prepare_for_onnx_export_()
         for layer in self.layers:
             layer.prepare_for_onnx_export_()
 
-    def forward(self, prev_output_tokens, encoder_out=None, incremental_state=None):
+    def get_empty_self_att_cache(self, bsz, max_src_len):
+        """
+        Returns:
+
+        cache where cache[l][i] = FloatTensor[bsz, num_heads, max_tgt_len - 1,
+        head_dim] for l = [0, num_layers) and i = 0, 1 (key, val)
+        """
+        state = []
+        num_heads = self.args.decoder_attention_heads
+        assert self.args.decoder_output_dim % num_heads == 0
+        head_dim = int(self.args.decoder_output_dim / num_heads)
+        for i, layer in enumerate(self.layers):
+            state.append((
+                torch.zeros(bsz, num_heads, self.max_tgt_len-1, head_dim),
+                torch.zeros(bsz, num_heads, self.max_tgt_len-1, head_dim),
+                ))
+        return state
+
+    def forward(self, prev_output_tokens, encoder_kv, self_attn_kv, src_len,
+            decoder_pos):
         """
         Args:
             prev_output_tokens (LongTensor): previous decoder outputs of shape
-                `(batch, tgt_len)`, for input feeding/teacher forcing
-            encoder_out (Tensor, optional): output from the encoder, used for
-                encoder-side attention
-            incremental_state (dict): dictionary used for storing state during
-                :ref:`Incremental decoding`
+                `(batch, max_tgt_len)`, for input feeding/teacher forcing
+
+            encoder_kv: Output of `get_encoder_kv_cache`: list of
+            encoder kv cache `cache`, where len(cache) == len(self.layers),
+            cache[i] is (k, v) where k.size() == v.size() == [bsz, num_heads,
+            max_src_len, head_dim], usually [1, 8, 1024, 64].
+
+            self_attn_kv: Output of `get_empty_self_att_cache`.  cache where
+            cache[l][i] = FloatTensor[bsz, num_heads, max_tgt_len - 1,
+            head_dim] for l = [0, num_layers) and i = 0, 1 (key, val)
+
+            decoder_pos: starting from 0
 
         Returns:
             tuple:
@@ -476,17 +518,17 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 - the last decoder layer's attention weights of shape `(batch,
                   tgt_len, src_len)`
         """
+        prev_output_tokens = prev_output_tokens[:,:decoder_pos+1]
         # embed positions
         positions = self.embed_positions(
             prev_output_tokens,
-            incremental_state=incremental_state,
+            incremental_state=[], # something that's not None
         ) if self.embed_positions is not None else None
 
-        """
-        if incremental_state is not None:
-            prev_output_tokens = prev_output_tokens[:, -1:]
-            if positions is not None:
-                positions = positions[:, -1:]
+        #if incremental_state is not None:
+        prev_output_tokens = prev_output_tokens[:, -1:]
+        if positions is not None:
+            positions = positions[:, -1:]
 
         # embed tokens and positions
         x = self.embed_scale * self.embed_tokens(prev_output_tokens)
@@ -502,20 +544,26 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         x = x.transpose(0, 1)
         attn = None
 
-        inner_states = [x]
+        #inner_states = [x]
 
         # decoder layers
-        for layer in self.layers:
-            x, attn = layer(
+        for i, layer in enumerate(self.layers):
+            encoder_kv_i = encoder_kv[i]
+            self_attn_kv_i = self_attn_kv[i]
+            x, attn, new_self_attn_kv = layer(
                 x,
-                #encoder_out['encoder_out'] if encoder_out is not None else None,
-                encoder_out if encoder_out is not None else None,
-                #encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
-                None,
-                incremental_state,
-                self_attn_mask=self.buffered_future_mask(x) if incremental_state is None else None,
+                (encoder_kv_i[0][:,:,:src_len,:],
+                    encoder_kv_i[1][:,:,:src_len,:]),
+                (self_attn_kv_i[0][:,:,:decoder_pos,:],
+                    self_attn_kv_i[1][:,:,:decoder_pos,:]),
+                self_attn_mask=None,
+                decoder_pos=decoder_pos,
             )
-            inner_states.append(x)
+            #inner_states.append(x)
+            num_pads = self.max_tgt_len - 1 - decoder_pos - 1
+            k = nn.functional.pad(new_self_attn_kv[0], (0, 0, 0, num_pads))
+            v = nn.functional.pad(new_self_attn_kv[1], (0, 0, 0, num_pads))
+            self_attn_kv[i] = (k, v)
 
         if self.normalize:
             x = self.layer_norm(x)
@@ -534,9 +582,35 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 x = F.linear(x, self.embed_out)
 
         #return x, {'attn': attn, 'inner_states': inner_states}
-        return (x, attn, inner_states)
+        #return (x, attn, inner_states)
+        #return x, attn, incremental_state
+        return x, attn, self_attn_kv
+        #return inner_states
+        #return positions, x
+
+    def get_encoder_kv_cache(self, encoder_out, src_len):
         """
-        return positions
+
+        Input:
+
+        encoder_out: [max_src_len, bsz, encoder_embed_dim], usually
+        [1024, 1, 512]
+
+        Returns:
+
+        kv_cache: list of encoder kv cache `cache`, where len(cache) ==
+        len(self.layers), cache[i] is (k, v) where k.size() == v.size() ==
+        [bsz, num_heads, max_src_len, head_dim], usually [8, max_src_len, 64].
+        """
+        kv_cache = []
+        max_src_len = encoder_out.size(0)
+        num_pads = max_src_len - src_len
+        for layer in self.layers:
+            k, v = layer.get_encoder_kv_cache(encoder_out[:src_len])
+            k = nn.functional.pad(k, (0, 0, 0, num_pads))
+            v = nn.functional.pad(v, (0, 0, 0, num_pads))
+            kv_cache.append((k,v))
+        return kv_cache
 
     def max_positions(self):
         """Maximum output length supported by the decoder."""
@@ -697,14 +771,17 @@ class TransformerDecoderLayer(nn.Module):
     def prepare_for_onnx_export_(self):
         self.onnx_trace = True
 
-    def forward(self, x, encoder_out, encoder_padding_mask, incremental_state,
+    def forward(self, x, encoder_kv, self_attn_kv,
                 prev_self_attn_state=None, prev_attn_state=None, self_attn_mask=None,
-                self_attn_padding_mask=None):
+                self_attn_padding_mask=None, decoder_pos=None):
         """
         Args:
             x (Tensor): input to the layer of shape `(seq_len, batch, embed_dim)`
-            encoder_padding_mask (ByteTensor): binary ByteTensor of shape
-                `(batch, src_len)` where padding elements are indicated by ``1``.
+
+            self_attn_kv: self_attn_kv[i] = FloatTensor[bsz,
+            num_heads, decoder_pos, head_dim] for i = 0, 1 (key, value)
+
+            encoder_kv, self_attn_kv: truncated
 
         Returns:
             encoded output of shape `(batch, src_len, embed_dim)`
@@ -717,15 +794,8 @@ class TransformerDecoderLayer(nn.Module):
             prev_key, prev_value = prev_self_attn_state
             saved_state = {"prev_key": prev_key, "prev_value": prev_value}
             self.self_attn._set_input_buffer(incremental_state, saved_state)
-        x, _ = self.self_attn(
-            query=x,
-            key=x,
-            value=x,
-            key_padding_mask=self_attn_padding_mask,
-            incremental_state=incremental_state,
-            need_weights=False,
-            attn_mask=self_attn_mask,
-        )
+        # self attention
+        x, _, new_self_attn_kv = self.self_attn.forward_self_att(x, self_attn_kv)
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x
         x = self.maybe_layer_norm(self.self_attn_layer_norm, x, after=True)
@@ -740,13 +810,9 @@ class TransformerDecoderLayer(nn.Module):
                 prev_key, prev_value = prev_attn_state
                 saved_state = {"prev_key": prev_key, "prev_value": prev_value}
                 self.encoder_attn._set_input_buffer(incremental_state, saved_state)
-            x, attn = self.encoder_attn(
+            x, attn = self.encoder_attn.forward_encoder_att(
                 query=x,
-                key=encoder_out,
-                value=encoder_out,
-                key_padding_mask=encoder_padding_mask,
-                incremental_state=incremental_state,
-                static_kv=True,
+                encoder_kv=encoder_kv,
                 need_weights=(not self.training and self.need_attn),
             )
             x = F.dropout(x, p=self.dropout, training=self.training)
@@ -765,8 +831,20 @@ class TransformerDecoderLayer(nn.Module):
             saved_state = self.self_attn._get_input_buffer(incremental_state)
             #self_attn_state = saved_state["prev_key"], saved_state["prev_value"]
             #return x, attn, self_attn_state
-            return x, attn
-        return x, attn
+            return x, attn, new_self_attn_kv
+        return x, attn, new_self_attn_kv
+
+    def get_encoder_kv_cache(self, encoder_out):
+        """
+        encoder_out: [src_len, bsz, encoder_embed_dim], usually
+        [src_len, 1, 512]
+
+        Return:
+        k, v, each of size [bsz, num_heads, src_len, self.head_dim],
+        usually [1, 8, src_len, 64]
+        """
+        k, v = self.encoder_attn.forward_get_encoder_kv(encoder_out)
+        return k, v
 
     def maybe_layer_norm(self, layer_norm, x, before=False, after=False):
         assert before ^ after

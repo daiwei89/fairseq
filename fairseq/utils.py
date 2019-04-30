@@ -358,11 +358,12 @@ def make_positions(tensor, padding_idx, left_pad, onnx_trace=False):
     """
     if onnx_trace:
         range_buf = torch._dim_arange(like=tensor, dim=1) + padding_idx + 1
-        mask = tensor.ne(padding_idx)
-        positions = range_buf.expand_as(tensor)
-        if left_pad:
-            positions = positions - mask.size(1) + mask.long().sum(dim=1).unsqueeze(1)
-        return positions * mask.long() + padding_idx * (1 - mask.long())
+        return range_buf
+        #mask = tensor.ne(padding_idx)
+        #positions = range_buf.expand_as(tensor)
+        #if left_pad:
+        #    positions = positions - mask.size(1) + mask.long().sum(dim=1).unsqueeze(1)
+        #return positions * mask.long() + padding_idx * (1 - mask.long())
 
     max_pos = padding_idx + 1 + tensor.size(1)
     if not hasattr(make_positions, 'range_buf'):

@@ -57,13 +57,24 @@ class SinusoidalPositionalEmbedding(nn.Module):
             emb[padding_idx, :] = 0
         return emb
 
+    def get_embed_onnx(self, max_src_len):
+        self.weights = self.weights.type_as(self._float_tensor)
+        input = torch.ones([1, max_src_len], dtype=torch.int64)
+        positions = utils.make_positions(input, self.padding_idx, self.left_pad, self.onnx_trace)
+        flat_embeddings = self.weights.detach().index_select(0, positions.view(-1))
+        bsz = torch.tensor(1)
+        seq_len = torch.tensor(max_src_len)
+        embedding_shape = torch.cat((bsz.view(1), seq_len.view(1), torch.LongTensor([-1])))
+        embeddings = torch.onnx.operators.reshape_from_tensor_shape(flat_embeddings, embedding_shape)
+        return embeddings # shape: (1, seq_len, 512)
+
     def forward(self, input, incremental_state=None, timestep=None):
         """Input is expected to be of size [bsz x seqlen]."""
         bsz, seq_len = torch.onnx.operators.shape_as_tensor(input)
         max_pos = self.padding_idx + 1 + seq_len
         print("==== embedding forward, padding_idx:", self.padding_idx, "seq len:", seq_len, "max_pos:", max_pos)
         if self.weights is None or max_pos > self.weights.size(0):
-            print("===== Recompute expand embedding")
+            raise RuntimeError("Recompute expand embedding is disallowed")
             # recompute/expand embeddings if needed
             self.weights = SinusoidalPositionalEmbedding.get_embedding(
                 max_pos,
@@ -73,6 +84,7 @@ class SinusoidalPositionalEmbedding(nn.Module):
         self.weights = self.weights.type_as(self._float_tensor)
 
         if incremental_state is not None:
+            # This can happen for decoder
             # positions is the same for every token when decoding a single step
             pos = (timestep.int() + 1).long() if timestep is not None else seq_len
             if self.onnx_trace:
@@ -84,7 +96,7 @@ class SinusoidalPositionalEmbedding(nn.Module):
             flat_embeddings = self.weights.detach().index_select(0, positions.view(-1))
             embedding_shape = torch.cat((bsz.view(1), seq_len.view(1), torch.LongTensor([-1])))
             embeddings = torch.onnx.operators.reshape_from_tensor_shape(flat_embeddings, embedding_shape)
-            return embeddings
+            return embeddings # shape: (1, seq_len, 512)
         return self.weights.index_select(0, positions.view(-1)).view(bsz, seq_len, -1).detach()
 
     def max_positions(self):

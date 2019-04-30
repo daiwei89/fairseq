@@ -160,8 +160,6 @@ class MultiheadAttention(nn.Module):
             assert pos is not None
             saved_state = self._get_input_buffer(incremental_state, pos)
 
-            #print("cp1: len saved_state:", len(saved_state))
-            #if 'prev_key' in saved_state:
             #if len(saved_state) > 0:
             if len(torch.nonzero(saved_state[0])) > 0:
                 # previous time steps are cached - no need to recompute
@@ -209,7 +207,6 @@ class MultiheadAttention(nn.Module):
             #if 'prev_key' in saved_state:
             if len(saved_state) > 0:
                 #prev_key = saved_state['prev_key'].view(bsz * self.num_heads, -1, self.head_dim)
-                #print("saved_state", type(saved_state), len(saved_state))
                 prev_key = saved_state[0].view(bsz * self.num_heads, -1, self.head_dim)
                 if static_kv:
                     k = prev_key

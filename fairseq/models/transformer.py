@@ -145,8 +145,9 @@ class TransformerModel(FairseqModel):
                 tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
             )
 
-        encoder = TransformerEncoder(args, src_dict, encoder_embed_tokens)
         decoder = TransformerDecoder(args, tgt_dict, decoder_embed_tokens)
+        encoder = TransformerEncoder(args, src_dict, encoder_embed_tokens,
+                decoder=decoder)
         return TransformerModel(encoder, decoder)
 
 
@@ -271,7 +272,8 @@ class TransformerEncoder(FairseqEncoder):
             (default: True).
     """
 
-    def __init__(self, args, dictionary, embed_tokens, left_pad=True):
+    def __init__(self, args, dictionary, embed_tokens, left_pad=True,
+            decoder=None):
         super().__init__(dictionary)
         self.dropout = args.dropout
 
@@ -300,9 +302,12 @@ class TransformerEncoder(FairseqEncoder):
         if self.normalize:
             self.layer_norm = LayerNorm(embed_dim)
         self.max_src_len = args.max_source_positions
+        self.decoder = decoder
 
     def prepare_for_onnx_export_(self):
         self.embed_positions.prepare_for_onnx_export_()
+        if self.decoder:
+            self.decoder.prepare_for_onnx_export_()
 
     def forward(self, src_tokens, src_len, embed):
         """
@@ -338,13 +343,17 @@ class TransformerEncoder(FairseqEncoder):
         if self.normalize:
             x = self.layer_norm(x)
 
+        # kv_cache: [num_layers, 2, bsz, num_heads, src_len, head_dim],
+        # usually [6, 2, 1, 8, src_len, 64]. 2 == {key, value}
+        encoder_kv = self.decoder.get_encoder_kv_cache(x)
+
         #return {
         #    'encoder_out': x,  # T x B x C
         #    'encoder_padding_mask': encoder_padding_mask,  # B x T
         #}
         # Comment(daviddai): `encoder_padding_mask` is not None only if
         # `src_tokens` includes padding (self.padding_idx)
-        return x
+        return x, encoder_kv
 
     def reorder_encoder_out(self, encoder_out, new_order):
         """

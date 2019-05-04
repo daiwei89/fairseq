@@ -1,99 +1,75 @@
-# Introduction <img src="fairseq_logo.png" width="50"> 
+# Onnxified
+[Fairseq-0.6.1](https://github.com/pytorch/fairseq/commit/fbd4cef9a575b5f77ca05d4b7c3ad3adb11141ac)
 
-Fairseq(-py) is a sequence modeling toolkit that allows researchers and
-developers to train custom models for translation, summarization, language
-modeling and other text generation tasks. It provides reference implementations
-of various sequence-to-sequence models, including:
-- **Convolutional Neural Networks (CNN)**
-  - [Dauphin et al. (2017): Language Modeling with Gated Convolutional Networks](https://arxiv.org/abs/1612.08083)
-  - [Gehring et al. (2017): Convolutional Sequence to Sequence Learning](https://arxiv.org/abs/1705.03122)
-  - [Edunov et al. (2018): Classical Structured Prediction Losses for Sequence to Sequence Learning](https://arxiv.org/abs/1711.04956)
-  - [Fan et al. (2018): Hierarchical Neural Story Generation](https://arxiv.org/abs/1805.04833)
-- **LightConv and DynamicConv models**
-  - **_New_** [Wu et al. (2019): Pay Less Attention with Lightweight and Dynamic Convolutions](https://openreview.net/pdf?id=SkVhlh09tX)
-- **Long Short-Term Memory (LSTM) networks**
-  - [Luong et al. (2015): Effective Approaches to Attention-based Neural Machine Translation](https://arxiv.org/abs/1508.04025)
-  - [Wiseman and Rush (2016): Sequence-to-Sequence Learning as Beam-Search Optimization](https://arxiv.org/abs/1606.02960)
-- **Transformer (self-attention) networks**
-  - [Vaswani et al. (2017): Attention Is All You Need](https://arxiv.org/abs/1706.03762)
-  - [Ott et al. (2018): Scaling Neural Machine Translation](https://arxiv.org/abs/1806.00187)
-  - [Edunov et al. (2018): Understanding Back-Translation at Scale](https://arxiv.org/abs/1808.09381)
+To onnxify Transformer to be run in
+[NitroEspresso](https://gitlab-turi.corp.apple.com/turi/nitro_converter), you need:
 
-Fairseq features:
-- multi-GPU (distributed) training on one machine or across multiple machines
-- fast generation on both CPU and GPU with multiple search algorithms implemented:
-  - beam search
-  - Diverse Beam Search ([Vijayakumar et al., 2016](https://arxiv.org/abs/1610.02424))
-  - sampling (unconstrained and top-k)
-- large mini-batch training even on a single GPU via delayed updates
-- fast half-precision floating point (FP16) training
-- extensible: easily register new models, criterions, tasks, optimizers and learning rate schedulers
+1. A Python3 environment (e.g., virtualenv)
+2. Have read access to Blobby `s3://nitro_model_zoo` bucket to download the trained weights
 
-We also provide [pre-trained models](#pre-trained-models-and-examples) for several benchmark
-translation and language modeling datasets.
+Run the followings in the root directory of the repo:
 
-![Model](fairseq.gif)
-
-# Requirements and Installation
-* A [PyTorch installation](http://pytorch.org/)
-* For training new models, you'll also need an NVIDIA GPU and [NCCL](https://github.com/NVIDIA/nccl)
-* Python version 3.6
-
-Currently fairseq requires PyTorch version >= 1.0.0.
-Please follow the instructions here: https://github.com/pytorch/pytorch#installation.
-
-If you use Docker make sure to increase the shared memory size either with
-`--ipc=host` or `--shm-size` as command line options to `nvidia-docker run`.
-
-After PyTorch is installed, you can install fairseq with `pip`:
 ```
-pip install fairseq
+pip install -r requirements.txt
+sh download_models.sh
+python onnxify.py
 ```
 
-**Installing from source**
+The resulting onnx files are under
+`onnx/MT-bi-en_Var-zh_CN-v106-20190114-d299c44b0/`
 
-To install fairseq from source and develop locally:
-```
-git clone https://github.com/pytorch/fairseq
-cd fairseq
-pip install --editable .
-```
+Note: This version was forked from Fairseq repo on 09 Feb, 2019
 
-# Getting Started
+## Behind the Scene:
 
-The [full documentation](https://fairseq.readthedocs.io/) contains instructions
-for getting started, training new models and extending fairseq with new model
-types and tasks.
+It's highly nontrivial to convert Fairseq Transformer to onnx and ensure proper
+caching of decoder states for incremental decoding. Some major changes are:
 
-# Pre-trained models and examples
+1. Since `incremental_state` in Fairseq `TransformerDecoder` is a Python
+   dictionary (not supported in PyTorch JIT until v1.1.0), we need to convert
+   `incremental_state`, a messy nested dictionaries, to two 6-D tensors:
 
-We provide pre-trained models and pre-processed, binarized test sets for several tasks listed below,
-as well as example training and evaluation commands.
+   `encoder_kv`: [num_layers, 2, batch_size, num_heads, max_source_positions, head_dim]
+   `self_attn_kv`: [num_layers, 2, batch_size, num_heads, max_target_positions, head_dim]
 
-- [Translation](examples/translation/README.md): convolutional and transformer models are available
-- [Language Modeling](examples/language_model/README.md): convolutional models are available
+   where usually num_layers = 6, batch_size = 1, num_heads = 8,
+   max_*_positions = 1024, head_dim = 64. 2 is for {key, value} of the
+   attention.
 
-We also have more detailed READMEs to reproduce results from specific papers:
-- [Wu et al. (2019): Pay Less Attention with Lightweight and Dynamic Convolutions](examples/pay_less_attention_paper/README.md)
-- [Edunov et al. (2018): Classical Structured Prediction Losses for Sequence to Sequence Learning](https://github.com/pytorch/fairseq/tree/classic_seqlevel)
-- [Fan et al. (2018): Hierarchical Neural Story Generation](examples/stories/README.md)
-- [Ott et al. (2018): Scaling Neural Machine Translation](examples/scaling_nmt/README.md)
-- [Gehring et al. (2017): Convolutional Sequence to Sequence Learning](examples/conv_seq2seq/README.md)
-- [Dauphin et al. (2017): Language Modeling with Gated Convolutional Networks](examples/conv_lm/README.md)
+2. Properly output all incremental state. In the original Fairseq the
+   `encoder_kv` states are computed once during the first decoding step and is
+   cached. Since PyTorch JIT doesn't support `if` statement, this needs two
+   decoder computation graphs to achieve: the first graph computes the
+   `encoder_kv` and decode the first token, and the second graph decode the
+   rest of decoding tokens and take in `encoder_kv`. Not only is this
+   cumbersome, it stores the decoder weights twice (in two ONNX graphs).
 
-# Join the fairseq community
+   The solution is to move the computation of `encoder_kv` from the decoder to
+   encoder. Thus the encoder outputs the `encoder_kv` for each layer of
+   decoder. Our encoder still outputs the original encoded representation, but
+   it's not used. When we package into nitro program, the encoder will contain
+   projection weights to generate `encoder_kv`, and decoder will not have
+   those weights.
 
-* Facebook page: https://www.facebook.com/groups/fairseq.users
-* Google group: https://groups.google.com/forum/#!forum/fairseq-users
+   The decoder also needs to properly take in the self attention KV caches
+   (`self_attn_kv`) and return the updated cache.
 
-# License
-fairseq(-py) is BSD-licensed.
-The license applies to the pre-trained models as well.
-We also provide an additional patent grant.
+3. Because PyTorch `jit.trace` does not support any dynamic tensor shape (and Torch
+   Script doesn't work with `nn.ModuleList` at the time of this writing), to enable
+   dynamic computation in NitroEspresso we need to do a few technical tricks
+   during the conversion process so we don't have to fork PyTorch itself (much
+   more challenging).
 
-# Credits
-This is a PyTorch version of
-[fairseq](https://github.com/facebookresearch/fairseq), a sequence-to-sequence
-learning toolkit from Facebook AI Research. The original authors of this
-reimplementation are (in no particular order) Sergey Edunov, Myle Ott, and Sam
-Gross.
+4. Similar to #3, because `jit.trace` doesn't record any tensor shape
+   dynamically (shape changing with the input), positional embedding
+   computation is impossible. The workaround is to pre-compute the embedding
+   and output as part of `embedding.pkl` and eliminate the entire dynamic
+   embedding computation.
+
+
+Despite the changes above, we use the identical weights as `fairseq-0.6.1`.
+This means that if you train the model using the original `fairseq-0.6.1`, it
+can be loaded and onnxified using the above process, and the onnx can be
+further converted to Nitro and executed in Espresso. The code has been tested
+to reach numerical parity with the original fairseq-0.6.1 on a few samples.
+
